@@ -2,12 +2,41 @@ import argparse
 import cv2
 import glob
 import os
+import torch
+import tensorflow as tf
+import numpy as np
+from PIL import Image
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 
 from realesrgan import RealESRGANer
 from realesrgan.archs.srvgg_arch import SRVGGNetCompact
 
+def downscale_image(image, scale: int = 2):
+    """
+        Scales down images using bicubic downsampling.
+        Args:
+            image: 3D or 4D tensor of preprocessed image
+    """
+    image_size = []
+    if len(image.shape) == 3:
+        image_size = [image.shape[1], image.shape[0]]
+    else:
+        raise ValueError("Dimension mismatch. Can work only on single image.")
+
+    image = tf.squeeze(
+        tf.cast(
+            tf.clip_by_value(image, 0, 255), tf.uint8))
+
+    lr_image = np.asarray(
+        Image.fromarray(image.numpy()).resize(
+            [image_size[0] // scale, image_size[1] // scale],
+            Image.BICUBIC
+        )
+    )
+    lr_image = tf.expand_dims(lr_image, 0)
+    lr_image = tf.cast(lr_image, tf.float32)
+    return lr_image
 
 def main():
     """Inference demo for Real-ESRGAN.
@@ -51,7 +80,9 @@ def main():
         help='Image extension. Options: auto | jpg | png, auto means using the same extension as inputs')
     parser.add_argument(
         '-g', '--gpu-id', type=int, default=None, help='gpu device to use (default=None) can be 0,1,2 for multi-gpu')
-
+    parser.add_argument(
+        '--pre_downscale', type=int, default=1, help='Pre downscaling image')
+    
     args = parser.parse_args()
 
     # determine models according to model names
@@ -129,22 +160,42 @@ def main():
         paths = [args.input]
     else:
         paths = sorted(glob.glob(os.path.join(args.input, '*')))
-
+    
+    import json
+    from pathlib import Path
+    DS_NAME = Path(args.input).stem
+    JSON_PATH = f"results/{DS_NAME}/data.json"
+    with open(JSON_PATH, 'w', encoding='utf-8') as f:
+        json.dump([], f, ensure_ascii=False, indent=4)
+    
     for idx, path in enumerate(paths):
         imgname, extension = os.path.splitext(os.path.basename(path))
         print('Testing', idx, imgname)
 
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        # img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
         if len(img.shape) == 3 and img.shape[2] == 4:
             img_mode = 'RGBA'
         else:
             img_mode = None
+        img = np.array(tf.squeeze(downscale_image(tf.squeeze(img), scale=args.pre_downscale)))
+        try: 
+            import time
 
-        try:
+            start = time.time()
             if args.face_enhance:
                 _, _, output = face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
             else:
-                output, _ = upsampler.enhance(img, outscale=args.outscale)
+                output, _ = upsampler.enhance(img, outscale=args.outscale)       
+            time_elapsed = time.time() - start
+
+            diagnostic_data = [time_elapsed, *img.shape]
+            with open(JSON_PATH, 'r', encoding='utf-8') as f:
+                df = json.load(f)
+                df.append(diagnostic_data)
+            with open(JSON_PATH, 'w', encoding='utf-8') as f:
+                json.dump(df, f, ensure_ascii=False, indent=4)
+
         except RuntimeError as error:
             print('Error', error)
             print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
@@ -163,4 +214,5 @@ def main():
 
 
 if __name__ == '__main__':
+    print(torch.cuda.get_device_name(0))
     main()
